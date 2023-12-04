@@ -12,13 +12,13 @@
 struct virt2phys_process {
 	HANDLE id;
 	LIST_ENTRY next;
-	SINGLE_LIST_ENTRY blocks;
+	LIST_ENTRY blocks;
 	ULONG64 memory;
 };
 
 struct virt2phys_block {
 	PMDL mdl;
-	SINGLE_LIST_ENTRY next;
+	LIST_ENTRY next;
 };
 
 static struct virt2phys_params g_params;
@@ -69,24 +69,28 @@ virt2phys_process_create(HANDLE process_id)
 	struct virt2phys_process *process;
 
 	process = ExAllocatePoolZero(NonPagedPool, sizeof(*process), 'pp2v');
-	if (process != NULL)
+	if (process != NULL) {
 		process->id = process_id;
+		InitializeListHead(&process->blocks);
+	}
+
 	return process;
 }
 
 static void
 virt2phys_process_free(struct virt2phys_process *process, BOOLEAN unmap)
 {
-	PSINGLE_LIST_ENTRY node;
+	PLIST_ENTRY node, next;
 	struct virt2phys_block *block;
 
 	TraceInfo("ID = %p, unmap = %!bool!", process->id, unmap);
 
-	node = process->blocks.Next;
-	while (node != NULL) {
+	for (node = process->blocks.Flink; node != &process->blocks; node = next) {
+		next = node->Flink;
 		block = CONTAINING_RECORD(node, struct virt2phys_block, next);
-		node = node->Next;
-		virt2phys_block_free(block, unmap);
+		RemoveEntryList(&block->next);
+
+		virt2phys_block_free(block, TRUE);
 	}
 
 	ExFreePool(process);
@@ -109,10 +113,10 @@ virt2phys_process_find(HANDLE process_id)
 static struct virt2phys_block *
 virt2phys_process_find_block(struct virt2phys_process *process, PVOID virt)
 {
-	PSINGLE_LIST_ENTRY node;
+	PLIST_ENTRY node;
 	struct virt2phys_block *cur;
 
-	for (node = process->blocks.Next; node != NULL; node = node->Next) {
+	for (node = process->blocks.Flink; node != &process->blocks; node = node->Flink) {
 		cur = CONTAINING_RECORD(node, struct virt2phys_block, next);
 		if (cur->mdl->StartVa == virt)
 			return cur;
@@ -182,7 +186,7 @@ virt2phys_process_cleanup(HANDLE process_id)
 }
 
 static struct virt2phys_block *
-virt2phys_find_block(HANDLE process_id, void *virt,
+virt2phys_find_block(HANDLE process_id, PVOID virt,
 	struct virt2phys_process **process)
 {
 	PLIST_ENTRY node;
@@ -244,13 +248,13 @@ virt2phys_add_block(struct virt2phys_process *process,
 		return STATUS_QUOTA_EXCEEDED;
 	}
 
-	PushEntryList(&process->blocks, &block->next);
+	InsertHeadList(&process->blocks, &block->next);
 	process->memory += size;
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS
-virt2phys_query_memory(void *virt, void **base, size_t *size)
+virt2phys_query_memory(PVOID virt, PVOID *base, size_t *size)
 {
 	MEMORY_BASIC_INFORMATION info;
 	SIZE_T info_size;
@@ -321,7 +325,7 @@ virt2phys_check_memory(PMDL mdl)
 }
 
 static NTSTATUS
-virt2phys_lock_memory(void *virt, size_t size, PMDL *mdl)
+virt2phys_lock_memory(PVOID virt, size_t size, PMDL *mdl)
 {
 	*mdl = IoAllocateMdl(virt, (ULONG)size, FALSE, FALSE, NULL);
 	if (*mdl == NULL)
@@ -346,12 +350,35 @@ virt2phys_unlock_memory(PMDL mdl)
 	IoFreeMdl(mdl);
 }
 
+static BOOLEAN
+virt2phys_is_valid_block(struct virt2phys_block *block, PVOID virt)
+{
+	/*
+	 * Check if MDL in block stores the valid physical address.
+	 * The virtual to physical memory mapping may be changed when the
+	 * virtual memory region is freed by the user process and malloc again,
+	 * then we need to remove the block and create a new one.
+	 */
+	PHYSICAL_ADDRESS block_phys, real_phys;
+
+	block_phys = virt2phys_block_translate(block, virt);
+	real_phys = MmGetPhysicalAddress(virt);
+
+	if (block_phys.QuadPart == real_phys.QuadPart)
+		return TRUE;
+
+	TraceWarning("VA = %p, invalid block physical address %llx, valid address %llx",
+		virt, block_phys.QuadPart, real_phys.QuadPart);
+
+	return FALSE;
+}
+
 NTSTATUS
 virt2phys_translate(PVOID virt, PHYSICAL_ADDRESS *phys)
 {
 	PMDL mdl;
 	HANDLE process_id;
-	void *base;
+	PVOID base;
 	size_t size;
 	struct virt2phys_process *process;
 	struct virt2phys_block *block;
@@ -371,8 +398,17 @@ virt2phys_translate(PVOID virt, PHYSICAL_ADDRESS *phys)
 
 	/* Don't lock the same memory twice. */
 	if (block != NULL) {
-		*phys = virt2phys_block_translate(block, virt);
-		return STATUS_SUCCESS;
+		if (virt2phys_is_valid_block(block, base)) {
+			*phys = virt2phys_block_translate(block, virt);
+			return STATUS_SUCCESS;
+		}
+		/* Remove the invalid block. */
+		KeAcquireSpinLock(g_lock, &irql);
+		RemoveEntryList(&block->next);
+		process->memory -= MmGetMdlByteCount(block->mdl);
+		KeReleaseSpinLock(g_lock, irql);
+
+		virt2phys_block_free(block, TRUE);
 	}
 
 	status = virt2phys_lock_memory(base, size, &mdl);

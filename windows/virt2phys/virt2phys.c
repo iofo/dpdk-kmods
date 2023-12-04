@@ -182,7 +182,7 @@ virt2phys_device_EvtIoInCallerContext(WDFDEVICE device, WDFREQUEST request)
 {
 	WDF_REQUEST_PARAMETERS params;
 	ULONG code;
-	PVOID *virt;
+	PVOID *pvirt, virt;
 	PHYSICAL_ADDRESS *phys;
 	size_t size;
 	NTSTATUS status;
@@ -207,12 +207,13 @@ virt2phys_device_EvtIoInCallerContext(WDFDEVICE device, WDFREQUEST request)
 	}
 
 	status = WdfRequestRetrieveInputBuffer(
-			request, sizeof(*virt), (PVOID *)&virt, &size);
+			request, sizeof(*pvirt), (PVOID *)&pvirt, &size);
 	if (!NT_SUCCESS(status)) {
 		TraceWarning("Retrieving input buffer: %!STATUS!", status);
 		WdfRequestComplete(request, status);
 		return;
 	}
+	virt = *pvirt;
 
 	status = WdfRequestRetrieveOutputBuffer(
 		request, sizeof(*phys), (PVOID *)&phys, &size);
@@ -222,7 +223,7 @@ virt2phys_device_EvtIoInCallerContext(WDFDEVICE device, WDFREQUEST request)
 		return;
 	}
 
-	status = virt2phys_translate(*virt, phys);
+	status = virt2phys_translate(virt, phys);
 	if (NT_SUCCESS(status))
 		WdfRequestSetInformation(request, sizeof(*phys));
 
